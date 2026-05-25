@@ -1,36 +1,114 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# MediaManager
 
-## Getting Started
+A personal dashboard for tracking WEBRip movies in a local Plex library and flagging titles where YTS has a BluRay version available for download.
 
-First, run the development server:
+**Current version: v0.1.0**
+
+## How it works
+
+1. Connects to your local Plex server and pulls every movie.
+2. Filters to files whose filename contains `WEBRip` (case-insensitive).
+3. Stores them in a local SQLite database at `./data/mediamanager.db`.
+4. For each movie with an IMDb ID, queries the YTS API and flags it if a BluRay torrent is available.
+5. Renders everything in a dashboard at `http://localhost:3000` — movies with available BluRay upgrades sort to the top, with a green badge linking to the YTS page.
+
+Everything runs locally on the same machine as your Plex server. No data leaves your network.
+
+## Setup
+
+### 1. Install dependencies
+
+```bash
+cd site
+npm install
+```
+
+### 2. Get your Plex token
+
+1. Open Plex Web (usually `http://localhost:32400/web`).
+2. Open any movie -> three-dot (`...`) menu -> **Get Info** -> **View XML**.
+3. The new browser tab's URL contains `X-Plex-Token=...` -- copy that value.
+
+### 3. Configure environment
+
+Open `site/.env.local` and paste the token:
+
+```
+PLEX_TOKEN=your_token_here
+PLEX_URL=http://localhost:32400
+YTS_API_BASE=https://yts.bz/api/v2
+```
+
+`YTS_API_BASE` defaults to `yts.bz` because the canonical `yts.mx` is DNS-blocked by many US ISPs (including AT&T). Both mirrors serve the same API; change this if your chosen mirror stops responding.
+
+### 4. Run the dev server
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+### 5. First-run flow
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+1. Click **Sync from Plex** — pulls your WEBRip files into the local DB. Takes a few seconds.
+2. Click **Check YTS** — looks up every movie with an IMDb ID against YTS and flags BluRay upgrades. Takes ~1 minute for several hundred movies (250 ms between requests to stay polite). A progress bar shows the live status.
+3. The dashboard reloads with upgrade badges. Click any green BluRay badge to open the YTS page in a new tab.
 
-## Learn More
+## Project structure
 
-To learn more about Next.js, take a look at the following resources:
+```
+site/
+├── app/
+│   ├── api/
+│   │   ├── sync/route.ts        # POST /api/sync - pulls Plex into DB
+│   │   └── check-yts/route.ts   # POST /api/check-yts - streams NDJSON progress
+│   ├── page.tsx                 # Dashboard (Server Component, reads from DB)
+│   ├── SyncButton.tsx           # Client component for Plex sync
+│   ├── CheckYtsButton.tsx       # Client component for YTS check + progress bar
+│   └── layout.tsx
+├── lib/
+│   ├── db.ts                    # SQLite setup, schema, auto-migration
+│   ├── plex.ts                  # Plex API client
+│   ├── sync.ts                  # Plex -> DB orchestration
+│   ├── yts.ts                   # YTS API client + summary logic
+│   └── yts-check.ts             # YTS check orchestration with progress callbacks
+├── scripts/
+│   └── test-yts.ts              # Debug script: hit YTS for one movie
+├── data/                        # Local SQLite DB (gitignored)
+├── .env.local                   # Plex token (gitignored)
+└── .env.example
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Debugging the YTS path
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+Run a one-off lookup against the first movie in your DB:
 
-## Deploy on Vercel
+```bash
+npx --yes tsx --env-file=.env.local scripts/test-yts.ts
+```
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+Or test against a specific IMDb ID:
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+```bash
+npx --yes tsx --env-file=.env.local scripts/test-yts.ts tt0468569
+```
+
+Prints the raw YTS torrent list and the summarized upgrade decision.
+
+## Known limitations (v0.1.0)
+
+- **IMDb ID coverage.** Plex's bulk listing endpoint does not reliably return the `Guid[]` array for every movie, so movies matched by older Plex agents (or otherwise missing the new GUID structure) get no IMDb ID and are skipped by the YTS check. A future release will fetch per-item metadata and parse the legacy `guid` field as a fallback.
+- **IMDb-only matching.** No title + year fallback yet. Movies without an IMDb ID cannot be checked against YTS.
+- **Single user, local only.** No auth, no multi-user, no deployment story. Runs on `localhost`.
+
+## Tech stack
+
+- Next.js 16 (App Router, Turbopack)
+- TypeScript
+- Tailwind CSS v4
+- better-sqlite3
+- The Plex local HTTP API (no SDK; plain `fetch`)
+- The YTS public API (`/api/v2/movie_details.json`)
+
+See [CHANGELOG.md](CHANGELOG.md) for release history.
