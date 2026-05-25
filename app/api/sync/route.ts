@@ -3,6 +3,9 @@ import { runSync } from '@/lib/sync';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+// First-run sync may resolve hundreds of IMDb IDs via Plex's cloud metadata
+// service; allow up to 5 minutes.
+export const maxDuration = 300;
 
 export async function POST() {
   try {

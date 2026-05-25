@@ -3,6 +3,10 @@ import { lookupByImdbId, summarize } from './yts';
 
 const REQUEST_DELAY_MS = 250;
 const STALE_MS = 24 * 60 * 60 * 1000;
+/** Every N successful movies, sleep an extra beat to let the OS scheduler
+ *  breathe. Helps avoid sustained CPU/network pressure on long runs. */
+const BATCH_SIZE = 50;
+const BATCH_PAUSE_MS = 1500;
 
 export interface YtsCheckResult {
   considered: number;     // movies with an IMDb ID
@@ -45,6 +49,9 @@ interface Candidate {
 
 export interface RunYtsCheckOptions {
   force?: boolean;
+  /** Aborts the loop between movies. Used by the API route to halt work when
+   *  the client disconnects (i.e. user clicks Pause). */
+  signal?: AbortSignal;
   onStart?: (e: StartEvent) => void;
   onProgress?: (e: ProgressEvent) => void;
 }
@@ -118,6 +125,7 @@ export async function runYtsCheck(opts: RunYtsCheckOptions = {}): Promise<YtsChe
 
   let index = 0;
   for (const row of toCheck) {
+    if (opts.signal?.aborted) break;
     index++;
     let status: ProgressStatus = 'no_bluray';
     let errorMessage: string | undefined;
@@ -165,6 +173,11 @@ export async function runYtsCheck(opts: RunYtsCheckOptions = {}): Promise<YtsChe
     });
 
     await sleep(REQUEST_DELAY_MS);
+
+    // Periodic breathing pause to keep system load smooth on long runs.
+    if (index % BATCH_SIZE === 0 && index < toCheck.length) {
+      await sleep(BATCH_PAUSE_MS);
+    }
   }
 
   return result;

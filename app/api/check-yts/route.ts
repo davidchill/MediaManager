@@ -11,13 +11,21 @@ export async function POST(request: NextRequest) {
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
+      let consumerGone = false;
       const send = (obj: unknown) => {
-        controller.enqueue(encoder.encode(JSON.stringify(obj) + '\n'));
+        if (consumerGone) return;
+        try {
+          controller.enqueue(encoder.encode(JSON.stringify(obj) + '\n'));
+        } catch {
+          // Stream closed by consumer (Pause). Stop trying to write.
+          consumerGone = true;
+        }
       };
 
       try {
         const result = await runYtsCheck({
           force,
+          signal: request.signal,
           onStart: (e) => send({ type: 'start', ...e }),
           onProgress: (e) => send({ type: 'progress', ...e }),
         });
@@ -26,8 +34,16 @@ export async function POST(request: NextRequest) {
         const message = e instanceof Error ? e.message : String(e);
         send({ type: 'done', ok: false, error: message });
       } finally {
-        controller.close();
+        try {
+          controller.close();
+        } catch {
+          // Already closed.
+        }
       }
+    },
+    cancel() {
+      // Consumer aborted. The orchestrator is watching request.signal and will
+      // exit between movies on its own, so there is nothing to do here.
     },
   });
 

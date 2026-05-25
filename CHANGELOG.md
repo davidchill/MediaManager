@@ -2,6 +2,33 @@
 
 All notable changes to MediaManager will be documented in this file.
 
+## v0.1.1 – 2026-05-25
+
+Fixes the IMDb-ID resolution gap that left ~80% of the library unchecked in v0.1.0, plus performance and UX work on the YTS check so long runs don't bog the host machine down.
+
+### Added
+
+- **Plex cloud GUID resolution** (`lib/plex.ts`). For movies whose local Plex API response returns `Guid: null` (the case for libraries matched by the new Plex Movie agent — most libraries), the sync now extracts the hash from the singular `guid` field (`plex://movie/<hash>`) and queries `https://metadata.provider.plex.tv/library/metadata/<hash>` to resolve external IMDb / TMDb / TVDB IDs. Resolves the IMDb ID for nearly every matched movie.
+- **Legacy-agent IMDb parser** (`extractLegacyImdbId`). Also recovers IMDb IDs from libraries still using the legacy `com.plexapp.agents.imdb://tt...?lang=en` guid format.
+- **Pause / Resume on YTS check**. Mid-run, the Check YTS / Force all buttons swap out for a **Pause** button. Clicking it aborts the fetch via `AbortController`; the server's orchestrator watches `request.signal` and exits cleanly between movies. Already-completed work persists. Click **Check YTS** again to resume — the 24-hour stale gate skips everything already done.
+- **Periodic breathing pauses.** Every 50 movies the YTS orchestrator sleeps an extra 1.5 seconds. Adds ~10 seconds to a full run but lets the OS scheduler breathe so the host machine stays responsive.
+- **Throttled progress UI.** The progress bar coalesces re-renders to at most one every 250 ms regardless of incoming event rate, reducing React work during long runs without losing visual smoothness.
+- **Production-mode documentation** in the README. Explains `npm run build && npm start` as a low-overhead alternative to `npm run dev` for long operations — the dev server's per-request instrumentation (HMR, tracing, source maps) was responsible for most of the observed slowdown during full library checks.
+- **Diagnostic scripts**:
+  - `scripts/inspect-plex.ts` — probes multiple Plex endpoint variants on a single movie to find which (if any) returns external IDs. Used to diagnose the v0.1.0 IMDb gap.
+  - `scripts/verify-cloud-lookup.ts` — runs cloud-GUID resolution on 5 unresolved movies and prints the results without touching the DB.
+
+### Changed
+
+- **Sync result schema and message.** `runSync()` now returns `cloudLookups`, `cloudResolved`, `cloudFailures`, and `stillMissingImdb` in addition to the existing fields. The Sync from Plex button reports these so you can see how many IMDb IDs were resolved on the run.
+- **Sync UPSERT** now uses `COALESCE(excluded.imdb_id, movies.imdb_id)` so a transient cloud lookup failure on a later sync cannot blank out a previously-resolved IMDb ID.
+- **`/api/sync` route** sets `maxDuration = 300` since the first sync resolves hundreds of IMDb IDs sequentially.
+- **`/api/check-yts` route** now pipes `request.signal` into the orchestrator and tolerates `controller.enqueue` failures after the consumer (browser) has aborted.
+
+### Fixed
+
+- "Force all" effectively did nothing for movies without IMDb IDs in v0.1.0. With v0.1.1's cloud resolution, the YTS check now covers nearly the entire library on the first sync.
+
 ## v0.1.0 – 2026-05-25
 
 Initial release. Pulls the WEBRip subset of a local Plex library into a SQLite-backed dashboard and cross-references each title against YTS to flag movies where a BluRay version is available for download.

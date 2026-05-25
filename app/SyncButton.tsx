@@ -15,7 +15,16 @@ export default function SyncButton() {
       const res = await fetch('/api/sync', { method: 'POST' });
       const data = await res.json();
       if (data.ok) {
-        setMsg(`Synced ${data.webripCount} WEBRips (scanned ${data.totalScanned} movies across ${data.librariesScanned} ${data.librariesScanned === 1 ? 'library' : 'libraries'})`);
+        const parts = [
+          `Synced ${data.webripCount} WEBRips (scanned ${data.totalScanned} movies across ${data.librariesScanned} ${data.librariesScanned === 1 ? 'library' : 'libraries'})`,
+        ];
+        if (data.cloudLookups > 0) {
+          parts.push(`Resolved ${data.cloudResolved}/${data.cloudLookups} IMDb IDs via Plex cloud${data.cloudFailures ? ` (${data.cloudFailures} failures)` : ''}.`);
+        }
+        if (data.stillMissingImdb > 0) {
+          parts.push(`${data.stillMissingImdb} still missing IMDb.`);
+        }
+        setMsg(parts.join(' '));
         router.refresh();
       } else {
         setMsg(`Error: ${data.error}`);

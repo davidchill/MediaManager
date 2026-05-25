@@ -2,7 +2,7 @@
 
 A personal dashboard for tracking WEBRip movies in a local Plex library and flagging titles where YTS has a BluRay version available for download.
 
-**Current version: v0.1.0**
+**Current version: v0.1.1**
 
 ## How it works
 
@@ -41,18 +41,27 @@ YTS_API_BASE=https://yts.bz/api/v2
 
 `YTS_API_BASE` defaults to `yts.bz` because the canonical `yts.mx` is DNS-blocked by many US ISPs (including AT&T). Both mirrors serve the same API; change this if your chosen mirror stops responding.
 
-### 4. Run the dev server
+### 4. Run the app
+
+For day-to-day editing, the dev server is fine:
 
 ```bash
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000).
+For long-running operations (full library sync, "Force all" YTS check), the dev server's per-request instrumentation (HMR, tracing, source maps) adds noticeable CPU and memory overhead. If your PC starts feeling sluggish during those operations, switch to production mode:
+
+```bash
+npm run build   # one-time, produces an optimized .next/ build
+npm start       # serves the build at http://localhost:3000
+```
+
+Production mode skips all dev instrumentation, so the app uses far less CPU and RAM. You'll need to re-run `npm run build` after any code changes; otherwise treat it like a normal server. Open [http://localhost:3000](http://localhost:3000).
 
 ### 5. First-run flow
 
 1. Click **Sync from Plex** — pulls your WEBRip files into the local DB. Takes a few seconds.
-2. Click **Check YTS** — looks up every movie with an IMDb ID against YTS and flags BluRay upgrades. Takes ~1 minute for several hundred movies (250 ms between requests to stay polite). A progress bar shows the live status.
+2. Click **Check YTS** — looks up every movie with an IMDb ID against YTS and flags BluRay upgrades. Takes ~1–2 minutes for several hundred movies (250 ms between requests, plus a 1.5 s breathing pause every 50 movies to keep system load smooth). A progress bar shows the live status. Click **Pause** to stop mid-run; already-checked movies are persisted and will be skipped when you resume.
 3. The dashboard reloads with upgrade badges. Click any green BluRay badge to open the YTS page in a new tab.
 
 ## Project structure

@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 
 type ProgressStatus = 'upgrade' | 'no_bluray' | 'not_on_yts' | 'error';
@@ -23,21 +23,71 @@ interface DoneSummary {
   errors?: number;
 }
 
+/** Minimum interval between progress re-renders. Events fire ~4/sec on the
+ *  server; coalescing to 4Hz client-side keeps React work negligible. */
+const UI_THROTTLE_MS = 250;
+
 export default function CheckYtsButton() {
   const [pending, setPending] = useState(false);
   const [progress, setProgress] = useState<ProgressState | null>(null);
   const [summary, setSummary] = useState<string | null>(null);
   const router = useRouter();
 
+  const abortRef = useRef<AbortController | null>(null);
+  const lastRenderRef = useRef(0);
+  const throttleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingProgressRef = useRef<ProgressState | null>(null);
+
+  function commitProgress(next: ProgressState) {
+    pendingProgressRef.current = next;
+    const now = Date.now();
+    const elapsed = now - lastRenderRef.current;
+
+    if (elapsed >= UI_THROTTLE_MS) {
+      setProgress(next);
+      lastRenderRef.current = now;
+      pendingProgressRef.current = null;
+      return;
+    }
+    if (throttleTimerRef.current) return;
+    throttleTimerRef.current = setTimeout(() => {
+      if (pendingProgressRef.current) {
+        setProgress(pendingProgressRef.current);
+        lastRenderRef.current = Date.now();
+        pendingProgressRef.current = null;
+      }
+      throttleTimerRef.current = null;
+    }, UI_THROTTLE_MS - elapsed);
+  }
+
+  function clearThrottle() {
+    if (throttleTimerRef.current) {
+      clearTimeout(throttleTimerRef.current);
+      throttleTimerRef.current = null;
+    }
+    pendingProgressRef.current = null;
+    lastRenderRef.current = 0;
+  }
+
+  function pause() {
+    abortRef.current?.abort();
+  }
+
   async function check(force: boolean) {
     setPending(true);
     setProgress(null);
     setSummary(null);
+    clearThrottle();
 
     let upgradesSoFar = 0;
+    const controller = new AbortController();
+    abortRef.current = controller;
 
     try {
-      const res = await fetch(`/api/check-yts${force ? '?force=1' : ''}`, { method: 'POST' });
+      const res = await fetch(`/api/check-yts${force ? '?force=1' : ''}`, {
+        method: 'POST',
+        signal: controller.signal,
+      });
       if (!res.body) throw new Error('No response body');
 
       const reader = res.body.getReader();
@@ -69,6 +119,7 @@ export default function CheckYtsButton() {
               status: 'no_bluray',
               upgradesSoFar: 0,
             });
+            lastRenderRef.current = Date.now();
             if (event.toCheck === 0) {
               setSummary(
                 `Nothing to check. ${event.skippedFresh} fresh, ${event.skippedNoImdb} without IMDb ID. Use "Force all" to recheck.`
@@ -76,7 +127,7 @@ export default function CheckYtsButton() {
             }
           } else if (event.type === 'progress') {
             if (event.status === 'upgrade') upgradesSoFar++;
-            setProgress({
+            commitProgress({
               index: event.index as number,
               total: event.total as number,
               title: event.title as string,
@@ -84,6 +135,7 @@ export default function CheckYtsButton() {
               upgradesSoFar,
             });
           } else if (event.type === 'done') {
+            clearThrottle();
             const d = event as unknown as DoneSummary;
             if (d.ok) {
               setSummary(
@@ -97,10 +149,19 @@ export default function CheckYtsButton() {
         }
       }
     } catch (e) {
-      setSummary(`Error: ${e instanceof Error ? e.message : String(e)}`);
+      if (e instanceof DOMException && e.name === 'AbortError') {
+        setSummary(
+          `Paused at ${pendingProgressRef.current?.index ?? progress?.index ?? '?'} / ${progress?.total ?? '?'}. Click "Check YTS" to resume — already-checked movies will be skipped.`
+        );
+        router.refresh();
+      } else {
+        setSummary(`Error: ${e instanceof Error ? e.message : String(e)}`);
+      }
     } finally {
+      clearThrottle();
       setPending(false);
       setProgress(null);
+      abortRef.current = null;
     }
   }
 
@@ -114,22 +175,32 @@ export default function CheckYtsButton() {
             {summary}
           </span>
         )}
-        <button
-          onClick={() => check(false)}
-          disabled={pending}
-          className="px-4 py-2 rounded-md bg-emerald-600 text-white text-sm font-medium hover:bg-emerald-700 disabled:opacity-50 transition-colors"
-          title="Skips movies checked in the last 24 hours."
-        >
-          {pending ? 'Checking…' : 'Check YTS'}
-        </button>
-        <button
-          onClick={() => check(true)}
-          disabled={pending}
-          className="px-3 py-2 rounded-md border border-zinc-300 dark:border-zinc-700 text-xs text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-900 disabled:opacity-50 transition-colors"
-          title="Force re-check every movie, ignoring the 24-hour skip."
-        >
-          Force all
-        </button>
+        {pending ? (
+          <button
+            onClick={pause}
+            className="px-4 py-2 rounded-md bg-amber-600 text-white text-sm font-medium hover:bg-amber-700 transition-colors"
+            title="Stop after the current movie. Already-checked movies are saved and will be skipped when you resume."
+          >
+            Pause
+          </button>
+        ) : (
+          <>
+            <button
+              onClick={() => check(false)}
+              className="px-4 py-2 rounded-md bg-emerald-600 text-white text-sm font-medium hover:bg-emerald-700 transition-colors"
+              title="Skips movies checked in the last 24 hours."
+            >
+              Check YTS
+            </button>
+            <button
+              onClick={() => check(true)}
+              className="px-3 py-2 rounded-md border border-zinc-300 dark:border-zinc-700 text-xs text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-900 transition-colors"
+              title="Force re-check every movie, ignoring the 24-hour skip."
+            >
+              Force all
+            </button>
+          </>
+        )}
       </div>
 
       {pending && progress && (
