@@ -12,6 +12,9 @@ import {
 } from './plex';
 
 const CLOUD_REQUEST_DELAY_MS = 150;
+/** If a sync would remove more than this fraction of the DB, skip removal and
+ *  flag it instead. Prevents a transient Plex outage from nuking everything. */
+const REMOVAL_SAFETY_THRESHOLD = 0.3;
 
 export interface SyncResult {
   librariesScanned: number;
@@ -25,6 +28,15 @@ export interface SyncResult {
   cloudFailures: number;
   /** Movies still missing an IMDb ID after the sync. */
   stillMissingImdb: number;
+  /** Rows deleted because the Plex item exists but is no longer a WEBRip
+   *  (i.e. the user upgraded to BluRay / web-dl / something else). */
+  removedUpgraded: number;
+  /** Rows deleted because the Plex item is gone entirely. */
+  removedDeleted: number;
+  /** True when the safety threshold tripped and removal was skipped. */
+  removalSkipped: boolean;
+  /** How many rows WOULD have been removed when the safety guard tripped. */
+  wouldHaveRemoved: number;
 }
 
 function sleep(ms: number) {
@@ -106,16 +118,28 @@ export async function runSync(): Promise<SyncResult> {
     cloudResolved: 0,
     cloudFailures: 0,
     stillMissingImdb: 0,
+    removedUpgraded: 0,
+    removedDeleted: 0,
+    removalSkipped: false,
+    wouldHaveRemoved: 0,
   };
+
+  // Track which Plex items we encountered, so we can detect rows in our DB
+  // that are no longer represented in Plex at all (deleted) or no longer
+  // qualify as WEBRips (upgraded to a better source).
+  const seenAnyKey = new Set<string>();
+  const seenWebripKey = new Set<string>();
 
   for (const lib of libraries) {
     const movies = await listMovies(lib.key);
     for (const m of movies) {
       result.totalScanned++;
+      seenAnyKey.add(m.ratingKey);
       const part = getFirstPart(m);
       if (!part) continue;
       if (!isWebrip(part.file)) continue;
       result.webripCount++;
+      seenWebripKey.add(m.ratingKey);
 
       const known = existingImdb.get(m.ratingKey) ?? null;
       const resolution = await resolveImdbId(m, known);
@@ -144,6 +168,52 @@ export async function runSync(): Promise<SyncResult> {
         first_seen_at: now,
         last_synced_at: now,
       });
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // Cleanup pass: remove rows whose Plex item is gone or no longer a WEBRip.
+  // ---------------------------------------------------------------
+  const allDbRows = db
+    .prepare(`SELECT id, plex_rating_key, title FROM movies`)
+    .all() as { id: number; plex_rating_key: string; title: string }[];
+
+  const toRemoveUpgraded: typeof allDbRows = [];
+  const toRemoveDeleted: typeof allDbRows = [];
+  for (const r of allDbRows) {
+    if (!seenAnyKey.has(r.plex_rating_key)) {
+      toRemoveDeleted.push(r);
+    } else if (!seenWebripKey.has(r.plex_rating_key)) {
+      toRemoveUpgraded.push(r);
+    }
+  }
+  const toRemoveCount = toRemoveUpgraded.length + toRemoveDeleted.length;
+
+  if (allDbRows.length > 0 && toRemoveCount / allDbRows.length > REMOVAL_SAFETY_THRESHOLD) {
+    // Don't trust this sync — too many rows would disappear. Bail on cleanup
+    // and surface the count so the user can investigate.
+    result.removalSkipped = true;
+    result.wouldHaveRemoved = toRemoveCount;
+    console.warn(
+      `Sync cleanup skipped: would remove ${toRemoveCount}/${allDbRows.length} rows (over ${Math.round(REMOVAL_SAFETY_THRESHOLD * 100)}% threshold). Investigate before forcing.`
+    );
+  } else if (toRemoveCount > 0) {
+    const deleteStmt = db.prepare(`DELETE FROM movies WHERE id = ?`);
+    const tx = db.transaction((rows: { id: number }[]) => {
+      for (const r of rows) deleteStmt.run(r.id);
+    });
+    tx([...toRemoveUpgraded, ...toRemoveDeleted]);
+    result.removedUpgraded = toRemoveUpgraded.length;
+    result.removedDeleted = toRemoveDeleted.length;
+    if (toRemoveUpgraded.length > 0) {
+      console.log(
+        `Removed ${toRemoveUpgraded.length} upgraded WEBRip(s): ${toRemoveUpgraded.map((r) => r.title).slice(0, 5).join(', ')}${toRemoveUpgraded.length > 5 ? '…' : ''}`
+      );
+    }
+    if (toRemoveDeleted.length > 0) {
+      console.log(
+        `Removed ${toRemoveDeleted.length} deleted-from-Plex movie(s): ${toRemoveDeleted.map((r) => r.title).slice(0, 5).join(', ')}${toRemoveDeleted.length > 5 ? '…' : ''}`
+      );
     }
   }
 

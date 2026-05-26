@@ -2,6 +2,28 @@
 
 All notable changes to MediaManager will be documented in this file.
 
+## v0.1.2 – 2026-05-25
+
+Adds automatic cleanup of upgraded/deleted movies during sync, and parallelizes the YTS check now that the dev-server overhead is no longer the bottleneck. Roughly 10x faster "Force all" runs.
+
+### Added
+
+- **Automatic removal on sync** (`lib/sync.ts`). During each sync we now track every Plex `ratingKey` we encounter (across all movie libraries) and classify them into two sets: all-seen vs. WEBRip-seen. After the sync pass, rows in the DB whose `ratingKey` is no longer in either set are deleted:
+  - **Removed (upgraded):** Plex still has the movie but the file is no longer a WEBRip — i.e. you replaced it with BluRay / WEB-DL / etc.
+  - **Removed (deleted):** Plex no longer has the movie at all.
+  - Both cases cascade to the `yts_checks` row via the existing foreign key.
+- **30% removal safety guard.** If a single sync would remove more than 30% of the DB, the cleanup is aborted and the count is reported as `wouldHaveRemoved` instead. Prevents a transient Plex outage or temporarily unmounted library from nuking everything.
+- **Sync result schema additions:** `removedUpgraded`, `removedDeleted`, `removalSkipped`, `wouldHaveRemoved`.
+- **Sync UI message** now includes removal counts when nonzero, e.g. *"Removed 3 upgraded, 1 deleted from Plex."* When the safety guard trips, the message shows a ⚠ warning instead.
+
+### Changed
+
+- **YTS check parallelized.** Replaced the sequential loop with a 4-worker pool that pulls from a shared cursor. SQLite writes still serialize via better-sqlite3's synchronous API. Abort signal still respected per-iteration.
+- **Per-request delay dropped** from 250 ms to 50 ms (per worker). Now configurable via `YTS_REQUEST_DELAY_MS` env var.
+- **Concurrency configurable** via `YTS_CONCURRENCY` env var (default 4).
+- **Removed the 50-movie / 1.5-second breathing pause.** It existed to protect the dev server's per-request overhead; with production mode the breathing pause is unnecessary.
+- For a ~322-movie "Force all" run: **~89 s → ~10 s** in our testing.
+
 ## v0.1.1 – 2026-05-25
 
 Fixes the IMDb-ID resolution gap that left ~80% of the library unchecked in v0.1.0, plus performance and UX work on the YTS check so long runs don't bog the host machine down.

@@ -2,7 +2,7 @@
 
 A personal dashboard for tracking WEBRip movies in a local Plex library and flagging titles where YTS has a BluRay version available for download.
 
-**Current version: v0.1.1**
+**Current version: v0.1.2**
 
 ## How it works
 

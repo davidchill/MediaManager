@@ -1,12 +1,14 @@
 import { getDb } from './db';
 import { lookupByImdbId, summarize } from './yts';
 
-const REQUEST_DELAY_MS = 250;
+/** Sleep between requests *within a single worker*. With 4 workers running
+ *  this still averages to ~30–40 requests/sec — well within polite limits
+ *  for the YTS API. Tune via env if you ever hit Cloudflare throttling. */
+const REQUEST_DELAY_MS = Number(process.env.YTS_REQUEST_DELAY_MS) || 50;
+/** Number of YTS lookups in flight at once. SQLite writes serialize naturally
+ *  via better-sqlite3's synchronous API, so this only governs network. */
+const CONCURRENCY = Number(process.env.YTS_CONCURRENCY) || 4;
 const STALE_MS = 24 * 60 * 60 * 1000;
-/** Every N successful movies, sleep an extra beat to let the OS scheduler
- *  breathe. Helps avoid sustained CPU/network pressure on long runs. */
-const BATCH_SIZE = 50;
-const BATCH_PAUSE_MS = 1500;
 
 export interface YtsCheckResult {
   considered: number;     // movies with an IMDb ID
@@ -123,10 +125,12 @@ export async function runYtsCheck(opts: RunYtsCheckOptions = {}): Promise<YtsChe
     errors: 0,
   };
 
-  let index = 0;
-  for (const row of toCheck) {
-    if (opts.signal?.aborted) break;
-    index++;
+  // Shared cursor + completion counter. JS is single-threaded so these
+  // pre/post-increments are race-free across the worker promises.
+  let cursor = 0;
+  let completed = 0;
+
+  async function processOne(row: Candidate) {
     let status: ProgressStatus = 'no_bluray';
     let errorMessage: string | undefined;
 
@@ -162,8 +166,9 @@ export async function runYtsCheck(opts: RunYtsCheckOptions = {}): Promise<YtsChe
       console.error(`YTS check failed for ${row.imdb_id}:`, e);
     }
 
+    completed++;
     opts.onProgress?.({
-      index,
+      index: completed,
       total: toCheck.length,
       movieId: row.id,
       imdbId: row.imdb_id!,
@@ -171,14 +176,20 @@ export async function runYtsCheck(opts: RunYtsCheckOptions = {}): Promise<YtsChe
       status,
       error: errorMessage,
     });
+  }
 
-    await sleep(REQUEST_DELAY_MS);
-
-    // Periodic breathing pause to keep system load smooth on long runs.
-    if (index % BATCH_SIZE === 0 && index < toCheck.length) {
-      await sleep(BATCH_PAUSE_MS);
+  async function worker() {
+    while (true) {
+      if (opts.signal?.aborted) return;
+      const i = cursor++;
+      if (i >= toCheck.length) return;
+      await processOne(toCheck[i]);
+      if (REQUEST_DELAY_MS > 0) await sleep(REQUEST_DELAY_MS);
     }
   }
+
+  const poolSize = Math.min(CONCURRENCY, toCheck.length || 1);
+  await Promise.all(Array.from({ length: poolSize }, () => worker()));
 
   return result;
 }

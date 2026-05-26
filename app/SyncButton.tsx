@@ -16,13 +16,21 @@ export default function SyncButton() {
       const data = await res.json();
       if (data.ok) {
         const parts = [
-          `Synced ${data.webripCount} WEBRips (scanned ${data.totalScanned} movies across ${data.librariesScanned} ${data.librariesScanned === 1 ? 'library' : 'libraries'})`,
+          `Synced ${data.webripCount} WEBRips (scanned ${data.totalScanned} movies across ${data.librariesScanned} ${data.librariesScanned === 1 ? 'library' : 'libraries'}).`,
         ];
         if (data.cloudLookups > 0) {
           parts.push(`Resolved ${data.cloudResolved}/${data.cloudLookups} IMDb IDs via Plex cloud${data.cloudFailures ? ` (${data.cloudFailures} failures)` : ''}.`);
         }
         if (data.stillMissingImdb > 0) {
           parts.push(`${data.stillMissingImdb} still missing IMDb.`);
+        }
+        if (data.removalSkipped) {
+          parts.push(`⚠ Cleanup skipped: would have removed ${data.wouldHaveRemoved} rows (>30% of DB). Investigate before re-syncing.`);
+        } else if (data.removedUpgraded > 0 || data.removedDeleted > 0) {
+          const bits: string[] = [];
+          if (data.removedUpgraded > 0) bits.push(`${data.removedUpgraded} upgraded`);
+          if (data.removedDeleted > 0) bits.push(`${data.removedDeleted} deleted from Plex`);
+          parts.push(`Removed ${bits.join(', ')}.`);
         }
         setMsg(parts.join(' '));
         router.refresh();
