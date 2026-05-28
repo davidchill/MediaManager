@@ -10,7 +10,13 @@
 
 import Database from 'better-sqlite3';
 import path from 'node:path';
-import { lookupByImdbId, summarize } from '../lib/yts';
+import {
+  lookupByImdbId,
+  summarize,
+  classifyCurrentFile,
+  isStrictUpgrade,
+  TIER_LABEL,
+} from '../lib/yts';
 
 interface MovieRow {
   id: number;
@@ -18,6 +24,7 @@ interface MovieRow {
   year: number | null;
   imdb_id: string | null;
   resolution: string | null;
+  video_codec: string | null;
   file_name: string | null;
 }
 
@@ -31,7 +38,7 @@ function pickMovie(): MovieRow | null {
   // First by alphabetical title — matches what the UI shows at the top.
   const row = db
     .prepare(
-      `SELECT id, title, year, imdb_id, resolution, file_name
+      `SELECT id, title, year, imdb_id, resolution, video_codec, file_name
        FROM movies
        ORDER BY title COLLATE NOCASE
        LIMIT 1`
@@ -52,12 +59,13 @@ async function main() {
 
   let imdbId: string;
   let movieLabel: string;
+  let row: MovieRow | null = null;
 
   if (cliImdb) {
     imdbId = cliImdb;
     movieLabel = `(from CLI) ${imdbId}`;
   } else {
-    const row = pickMovie();
+    row = pickMovie();
     if (!row) {
       console.error('No movies in the database. Run a Plex sync first.');
       process.exit(1);
@@ -108,9 +116,22 @@ async function main() {
   printDivider('Our summary');
   const summary = summarize(result.movie.torrents);
   console.log(JSON.stringify(summary, null, 2));
-  console.log(
-    `\n→ has_bluray_upgrade would be set to: ${summary.hasBluray ? 1 : 0}`
-  );
+
+  // Tier comparison only meaningful when we picked a real DB row.
+  if (row) {
+    const currentTier = classifyCurrentFile(row.resolution, row.video_codec);
+    const upgrade = isStrictUpgrade(currentTier, summary.bestTier);
+    printDivider('Upgrade decision');
+    const currentLabel =
+      currentTier === 'below' ? 'below tracked tiers' : TIER_LABEL[currentTier];
+    const bestLabel = summary.bestTier ? TIER_LABEL[summary.bestTier] : '—';
+    console.log(`  current tier: ${currentLabel}`);
+    console.log(`  best on YTS:  ${bestLabel}`);
+    console.log(`  → has_upgrade would be set to: ${upgrade ? 1 : 0}`);
+  } else {
+    printDivider('Upgrade decision');
+    console.log('  (skipped — no DB row, run without --imdb to test tier compare)');
+  }
 }
 
 main().catch((e) => {

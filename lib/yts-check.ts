@@ -1,5 +1,10 @@
 import { getDb } from './db';
-import { lookupByImdbId, summarize } from './yts';
+import {
+  lookupByImdbId,
+  summarize,
+  classifyCurrentFile,
+  isStrictUpgrade,
+} from './yts';
 
 /** Sleep between requests *within a single worker*. With 4 workers running
  *  this still averages to ~30–40 requests/sec — well within polite limits
@@ -46,6 +51,8 @@ interface Candidate {
   id: number;
   title: string;
   imdb_id: string | null;
+  resolution: string | null;
+  video_codec: string | null;
   checked_at: number | null;
 }
 
@@ -65,7 +72,7 @@ export async function runYtsCheck(opts: RunYtsCheckOptions = {}): Promise<YtsChe
 
   const rows = db
     .prepare(
-      `SELECT m.id, m.title, m.imdb_id, c.checked_at
+      `SELECT m.id, m.title, m.imdb_id, m.resolution, m.video_codec, c.checked_at
        FROM movies m
        LEFT JOIN yts_checks c ON c.movie_id = m.id
        ORDER BY m.title COLLATE NOCASE`
@@ -75,10 +82,10 @@ export async function runYtsCheck(opts: RunYtsCheckOptions = {}): Promise<YtsChe
   const upsert = db.prepare(`
     INSERT INTO yts_checks (
       movie_id, imdb_id, found, yts_id, yts_url, best_source, best_quality,
-      has_bluray_upgrade, bluray_qualities, torrents_json, checked_at
+      has_upgrade, upgrade_tier, current_tier, torrents_json, checked_at
     ) VALUES (
       @movie_id, @imdb_id, @found, @yts_id, @yts_url, @best_source, @best_quality,
-      @has_bluray_upgrade, @bluray_qualities, @torrents_json, @checked_at
+      @has_upgrade, @upgrade_tier, @current_tier, @torrents_json, @checked_at
     )
     ON CONFLICT(movie_id) DO UPDATE SET
       imdb_id = excluded.imdb_id,
@@ -87,8 +94,9 @@ export async function runYtsCheck(opts: RunYtsCheckOptions = {}): Promise<YtsChe
       yts_url = excluded.yts_url,
       best_source = excluded.best_source,
       best_quality = excluded.best_quality,
-      has_bluray_upgrade = excluded.has_bluray_upgrade,
-      bluray_qualities = excluded.bluray_qualities,
+      has_upgrade = excluded.has_upgrade,
+      upgrade_tier = excluded.upgrade_tier,
+      current_tier = excluded.current_tier,
       torrents_json = excluded.torrents_json,
       checked_at = excluded.checked_at
   `);
@@ -137,23 +145,28 @@ export async function runYtsCheck(opts: RunYtsCheckOptions = {}): Promise<YtsChe
     try {
       const lookup = await lookupByImdbId(row.imdb_id!);
       const summary = summarize(lookup.movie?.torrents);
+      const currentTier = classifyCurrentFile(row.resolution, row.video_codec);
+      const upgradeAvailable = isStrictUpgrade(currentTier, summary.bestTier);
       upsert.run({
         movie_id: row.id,
         imdb_id: row.imdb_id,
         found: lookup.found ? 1 : 0,
         yts_id: lookup.movie?.id ?? null,
         yts_url: lookup.movie?.url ?? null,
-        best_source: summary.bestSource,
-        best_quality: summary.bestQuality,
-        has_bluray_upgrade: summary.hasBluray ? 1 : 0,
-        bluray_qualities: summary.blurayQualities.join(',') || null,
+        best_source: summary.bestTorrent?.type ?? null,
+        best_quality: summary.bestTorrent?.quality ?? null,
+        has_upgrade: upgradeAvailable ? 1 : 0,
+        // Only record the YTS tier when it actually constitutes an upgrade;
+        // otherwise leave null so the UI can short-circuit cleanly.
+        upgrade_tier: upgradeAvailable ? summary.bestTier : null,
+        current_tier: currentTier === 'below' ? null : currentTier,
         torrents_json: lookup.movie?.torrents ? JSON.stringify(lookup.movie.torrents) : null,
         checked_at: Date.now(),
       });
       result.checked++;
       if (!lookup.found) {
         status = 'not_on_yts';
-      } else if (summary.hasBluray) {
+      } else if (upgradeAvailable) {
         status = 'upgrade';
         result.upgradesAvailable++;
       } else {

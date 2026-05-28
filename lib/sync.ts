@@ -11,10 +11,34 @@ import {
   type PlexMovie,
 } from './plex';
 
-const CLOUD_REQUEST_DELAY_MS = 150;
+/** Per-worker pause between Plex cloud lookups. With CLOUD_CONCURRENCY workers
+ *  this averages well under Plex's tolerance. Tune via env if needed. */
+const CLOUD_REQUEST_DELAY_MS = Number(process.env.PLEX_CLOUD_DELAY_MS) || 150;
+/** Number of in-flight Plex cloud lookups. SQLite isn't touched in this phase,
+ *  so this only governs network. */
+const CLOUD_CONCURRENCY = Number(process.env.PLEX_CLOUD_CONCURRENCY) || 4;
+/** Yield to the event loop every N scanned Plex movies so unrelated requests
+ *  (UI navigation, /api/* polls) aren't starved while we work. */
+const SCAN_YIELD_EVERY = 100;
+/** Log a heartbeat every N scanned movies so a hung sync is diagnosable from
+ *  the terminal — you can see exactly where it stopped. */
+const SCAN_HEARTBEAT_EVERY = 250;
+/** Phase 3 writes candidates in chunks of this size. Each chunk is one
+ *  transaction (one fsync, fast) and chunk boundaries release references so
+ *  GC can reclaim PlexMovie objects mid-write — keeps peak memory bounded. */
+const UPSERT_CHUNK_SIZE = 200;
 /** If a sync would remove more than this fraction of the DB, skip removal and
  *  flag it instead. Prevents a transient Plex outage from nuking everything. */
 const REMOVAL_SAFETY_THRESHOLD = 0.3;
+
+function logPhase(label: string, extra?: Record<string, unknown>) {
+  const ts = new Date().toISOString().slice(11, 23); // HH:MM:SS.mmm
+  if (extra && Object.keys(extra).length > 0) {
+    console.log(`[sync ${ts}] ${label}`, extra);
+  } else {
+    console.log(`[sync ${ts}] ${label}`);
+  }
+}
 
 export interface SyncResult {
   librariesScanned: number;
@@ -43,40 +67,43 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-/** Resolves an IMDb ID for a Plex movie using the cheapest source first.
- *  Returns null if even the cloud lookup didn't find one. */
-async function resolveImdbId(
-  movie: PlexMovie,
-  existingImdb: string | null
-): Promise<{ imdb: string | null; didCloudLookup: boolean; cloudError: boolean }> {
-  // 1. Already known in our DB.
-  if (existingImdb) return { imdb: existingImdb, didCloudLookup: false, cloudError: false };
+function yieldToEventLoop() {
+  return new Promise<void>((r) => setImmediate(r));
+}
 
-  // 2. New-agent Guid[] array on the local response (usually empty in practice).
+interface Candidate {
+  movie: PlexMovie;
+  part: { file: string; size: number };
+  /** IMDb already known in our DB; non-null means we can skip resolution. */
+  existingImdb: string | null;
+  /** Filled in during the resolve phase. */
+  resolvedImdb: string | null;
+  didCloudLookup: boolean;
+  cloudError: boolean;
+}
+
+/** Resolves IMDb ID from the cheapest local sources. Returns the cloud hash
+ *  to look up if none of the local sources hit. */
+function resolveLocal(movie: PlexMovie, existing: string | null): {
+  imdb: string | null;
+  cloudHash: string | null;
+} {
+  if (existing) return { imdb: existing, cloudHash: null };
   const fromArray = extractImdbId(movie);
-  if (fromArray) return { imdb: fromArray, didCloudLookup: false, cloudError: false };
-
-  // 3. Legacy agent guid string.
+  if (fromArray) return { imdb: fromArray, cloudHash: null };
   const fromLegacy = extractLegacyImdbId(movie);
-  if (fromLegacy) return { imdb: fromLegacy, didCloudLookup: false, cloudError: false };
-
-  // 4. Plex cloud metadata service (the slow path).
-  const hash = extractPlexCloudHash(movie);
-  if (!hash) return { imdb: null, didCloudLookup: false, cloudError: false };
-
-  try {
-    const cloud = await lookupCloudGuids(hash);
-    return { imdb: cloud.imdb, didCloudLookup: true, cloudError: false };
-  } catch (e) {
-    console.error(`Cloud lookup failed for ${movie.title} (${hash}):`, e);
-    return { imdb: null, didCloudLookup: true, cloudError: true };
-  }
+  if (fromLegacy) return { imdb: fromLegacy, cloudHash: null };
+  return { imdb: null, cloudHash: extractPlexCloudHash(movie) };
 }
 
 export async function runSync(): Promise<SyncResult> {
+  const startedAt = Date.now();
+  logPhase('start');
   const db = getDb();
   const now = Date.now();
+  logPhase('fetching Plex libraries');
   const libraries = await listMovieLibraries();
+  logPhase('libraries fetched', { count: libraries.length });
 
   // Snapshot current imdb_id values so we can skip cloud lookups for movies
   // we've already resolved on a previous sync.
@@ -86,6 +113,129 @@ export async function runSync(): Promise<SyncResult> {
     .all() as { plex_rating_key: string; imdb_id: string | null }[];
   for (const r of existingRows) existingImdb.set(r.plex_rating_key, r.imdb_id);
 
+  const result: SyncResult = {
+    librariesScanned: libraries.length,
+    totalScanned: 0,
+    webripCount: 0,
+    cloudLookups: 0,
+    cloudResolved: 0,
+    cloudFailures: 0,
+    stillMissingImdb: 0,
+    removedUpgraded: 0,
+    removedDeleted: 0,
+    removalSkipped: false,
+    wouldHaveRemoved: 0,
+  };
+
+  // Track which Plex items we encountered, so we can detect rows in our DB
+  // that are no longer represented in Plex at all (deleted) or no longer
+  // qualify as WEBRips (upgraded to a better source).
+  const seenAnyKey = new Set<string>();
+  const seenWebripKey = new Set<string>();
+
+  // ---------------------------------------------------------------
+  // Phase 1: scan Plex, collect WEBRip candidates. Yield periodically
+  // so unrelated requests can interleave.
+  // ---------------------------------------------------------------
+  const candidates: Candidate[] = [];
+  let sinceYield = 0;
+  let sinceHeartbeat = 0;
+  for (const lib of libraries) {
+    logPhase(`fetching library "${lib.title}" (${lib.key})`);
+    const movies = await listMovies(lib.key);
+    logPhase(`library "${lib.title}" fetched`, { movies: movies.length });
+    for (const m of movies) {
+      result.totalScanned++;
+      seenAnyKey.add(m.ratingKey);
+      const part = getFirstPart(m);
+      if (part && isWebrip(part.file)) {
+        result.webripCount++;
+        seenWebripKey.add(m.ratingKey);
+        candidates.push({
+          movie: m,
+          part,
+          existingImdb: existingImdb.get(m.ratingKey) ?? null,
+          resolvedImdb: null,
+          didCloudLookup: false,
+          cloudError: false,
+        });
+      }
+      if (++sinceYield >= SCAN_YIELD_EVERY) {
+        sinceYield = 0;
+        await yieldToEventLoop();
+      }
+      if (++sinceHeartbeat >= SCAN_HEARTBEAT_EVERY) {
+        sinceHeartbeat = 0;
+        logPhase('scan progress', {
+          scanned: result.totalScanned,
+          webrips: result.webripCount,
+        });
+      }
+    }
+  }
+  logPhase('scan complete', {
+    scanned: result.totalScanned,
+    webrips: result.webripCount,
+  });
+
+  // ---------------------------------------------------------------
+  // Phase 2: resolve IMDb IDs. Local sources are free; only cloud
+  // lookups go through a worker pool.
+  // ---------------------------------------------------------------
+  const needsCloud: { candidate: Candidate; hash: string }[] = [];
+  for (const c of candidates) {
+    const local = resolveLocal(c.movie, c.existingImdb);
+    if (local.imdb) {
+      c.resolvedImdb = local.imdb;
+    } else if (local.cloudHash) {
+      needsCloud.push({ candidate: c, hash: local.cloudHash });
+    }
+  }
+
+  logPhase('resolve phase', {
+    candidates: candidates.length,
+    needsCloud: needsCloud.length,
+  });
+
+  if (needsCloud.length > 0) {
+    let cursor = 0;
+    const worker = async () => {
+      while (true) {
+        const i = cursor++;
+        if (i >= needsCloud.length) return;
+        const { candidate, hash } = needsCloud[i];
+        candidate.didCloudLookup = true;
+        try {
+          const cloud = await lookupCloudGuids(hash);
+          candidate.resolvedImdb = cloud.imdb;
+        } catch (e) {
+          candidate.cloudError = true;
+          console.error(`Cloud lookup failed for ${candidate.movie.title} (${hash}):`, e);
+        }
+        if (CLOUD_REQUEST_DELAY_MS > 0) await sleep(CLOUD_REQUEST_DELAY_MS);
+      }
+    };
+    const poolSize = Math.min(CLOUD_CONCURRENCY, needsCloud.length);
+    await Promise.all(Array.from({ length: poolSize }, () => worker()));
+    logPhase('cloud lookups complete');
+  }
+
+  for (const c of candidates) {
+    if (c.didCloudLookup) {
+      result.cloudLookups++;
+      if (c.cloudError) result.cloudFailures++;
+      else if (c.resolvedImdb) result.cloudResolved++;
+    }
+    if (!c.resolvedImdb) result.stillMissingImdb++;
+  }
+
+  // ---------------------------------------------------------------
+  // Phase 3: write upserts in chunked transactions. Batching by
+  // UPSERT_CHUNK_SIZE keeps the fsync win of a real transaction while
+  // letting GC reclaim each chunk's PlexMovie objects as soon as it's
+  // written — peak memory stays bounded regardless of library size.
+  // ---------------------------------------------------------------
+  logPhase('write phase', { rows: candidates.length, chunkSize: UPSERT_CHUNK_SIZE });
   const upsert = db.prepare(`
     INSERT INTO movies (
       plex_rating_key, title, year, imdb_id, file_path, file_name,
@@ -110,66 +260,40 @@ export async function runSync(): Promise<SyncResult> {
       last_synced_at = excluded.last_synced_at
   `);
 
-  const result: SyncResult = {
-    librariesScanned: libraries.length,
-    totalScanned: 0,
-    webripCount: 0,
-    cloudLookups: 0,
-    cloudResolved: 0,
-    cloudFailures: 0,
-    stillMissingImdb: 0,
-    removedUpgraded: 0,
-    removedDeleted: 0,
-    removalSkipped: false,
-    wouldHaveRemoved: 0,
-  };
-
-  // Track which Plex items we encountered, so we can detect rows in our DB
-  // that are no longer represented in Plex at all (deleted) or no longer
-  // qualify as WEBRips (upgraded to a better source).
-  const seenAnyKey = new Set<string>();
-  const seenWebripKey = new Set<string>();
-
-  for (const lib of libraries) {
-    const movies = await listMovies(lib.key);
-    for (const m of movies) {
-      result.totalScanned++;
-      seenAnyKey.add(m.ratingKey);
-      const part = getFirstPart(m);
-      if (!part) continue;
-      if (!isWebrip(part.file)) continue;
-      result.webripCount++;
-      seenWebripKey.add(m.ratingKey);
-
-      const known = existingImdb.get(m.ratingKey) ?? null;
-      const resolution = await resolveImdbId(m, known);
-      if (resolution.didCloudLookup) {
-        result.cloudLookups++;
-        if (resolution.cloudError) result.cloudFailures++;
-        else if (resolution.imdb) result.cloudResolved++;
-        // Be polite to Plex's cloud service.
-        await sleep(CLOUD_REQUEST_DELAY_MS);
-      }
-      if (!resolution.imdb) result.stillMissingImdb++;
-
-      const fileName = part.file.split(/[\\/]/).pop() ?? part.file;
+  const upsertChunk = db.transaction((rows: Candidate[]) => {
+    for (const c of rows) {
+      const m = c.movie;
+      const fileName = c.part.file.split(/[\\/]/).pop() ?? c.part.file;
       upsert.run({
         plex_rating_key: m.ratingKey,
         title: m.title,
         year: m.year ?? null,
-        imdb_id: resolution.imdb,
-        file_path: part.file,
+        imdb_id: c.resolvedImdb,
+        file_path: c.part.file,
         file_name: fileName,
         resolution: m.Media?.[0]?.videoResolution ?? null,
         video_codec: m.Media?.[0]?.videoCodec ?? null,
-        file_size: part.size || null,
+        file_size: c.part.size || null,
         plex_added_at: m.addedAt ?? null,
         plex_updated_at: m.updatedAt ?? null,
         first_seen_at: now,
         last_synced_at: now,
       });
     }
+  });
+
+  let written = 0;
+  while (candidates.length > 0) {
+    // splice() removes the chunk from the array so its PlexMovie refs become
+    // unreachable as soon as the transaction completes.
+    const chunk = candidates.splice(0, UPSERT_CHUNK_SIZE);
+    upsertChunk(chunk);
+    written += chunk.length;
+    // Yield between chunks so the event loop can service other requests and
+    // V8 can run a short GC pass if it wants to.
+    await yieldToEventLoop();
   }
+  logPhase('write complete', { written });
 
   // ---------------------------------------------------------------
   // Cleanup pass: remove rows whose Plex item is gone or no longer a WEBRip.
@@ -217,5 +341,6 @@ export async function runSync(): Promise<SyncResult> {
     }
   }
 
+  logPhase('done', { elapsedMs: Date.now() - startedAt });
   return result;
 }

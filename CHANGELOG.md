@@ -2,6 +2,44 @@
 
 All notable changes to MediaManager will be documented in this file.
 
+## v0.1.3 – 2026-05-27
+
+Three independent threads landed this release: a tier-based redefinition of "upgrade available," sync-pipeline hardening to address a permanent server hang that required a hard reset, and live Plex activity visibility with manual scan controls on the dashboard.
+
+### Added
+
+- **Plex activity status pill** (`app/PlexSyncControls.tsx`, `app/api/plex-status/route.ts`). The dashboard polls Plex's `/activities` endpoint every 5 seconds and shows one of three states next to the Sync button:
+  - **Plex: idle** — green.
+  - **Plex: Updating Library — Movies (42%) · 1m 23s** — amber pill with pulsing dot, activity label, Plex-reported progress percentage, and an observation-elapsed timer that ticks once per second.
+  - **Plex: status unavailable** — gray; appears when `/activities` errors. Fails open (does not gate Sync).
+  - Filters to activities scoped to a movie library (`activity.type` starts with `library.` AND `Context.librarySectionID` is in our movie-libraries set). Ignores transcoding, deep analysis on TV libraries, subscription processing, etc.
+- **Sync button auto-disables while Plex is busy.** Tooltip explains why ("Plex is currently scanning a movie library — wait for it to finish to avoid contention."). Re-enables automatically when Plex goes idle.
+- **Start scan / Stop scan buttons** (`app/api/plex-scan/start/route.ts`, `app/api/plex-scan/stop/route.ts`). Contextual: **Stop** appears only when Plex is busy; **Start** appears only when Plex is idle and reachable. Both act on every movie library at once and force an immediate status re-poll on click so the pill updates within ~1 second instead of waiting up to 5 s for the next interval. Status line below the buttons reports `Started scan on N libraries.` / `Cancelled scan on N libraries.` / errors.
+- **Tier-based upgrade detection** (`lib/yts.ts`). Replaces the v0.1.0–0.1.2 "any BluRay torrent flags an upgrade" rule with a ranked tier system:
+  1. BluRay @ 1080p
+  2. BluRay @ 720p
+  3. WEB @ 1080p.x265
+  4. WEB @ 1080p
+  - `classifyTorrent()` maps a YTS torrent to one of those tiers or null (anything else is ignored). `web` and `webrip` are treated as the same source per project spec.
+  - `classifyCurrentFile(resolution, codec)` maps the file already on disk into a tier (or `'below'` for sub-1080p).
+  - `isStrictUpgrade(current, best)` returns true only when YTS's best matching tier is strictly higher-priority than the file on disk. A 1080p hevc WEBRip is not "upgraded" by another 1080p WEB torrent.
+- **Heartbeat logs in `runSync()`.** New `logPhase()` helper prints `[sync HH:MM:SS.mmm] <label>` at every phase boundary (start, libraries fetched, per-library fetch begin/end, scan progress every 250 movies, resolve, cloud lookups complete, write begin/end, done with `elapsedMs`). Makes a future hang diagnosable from the terminal — you can see exactly which call stopped advancing.
+- **Plex fetch timeouts** (`lib/plex.ts`). All local-Plex requests now use `AbortSignal.timeout(60_000)`; cloud-metadata lookups use `AbortSignal.timeout(30_000)`. A stuck Plex socket now surfaces as a clear `Error` ("Plex request timed out after 60s for /library/sections/... Plex may be mid-scan or unresponsive.") instead of an indefinite hang. This addresses the v0.1.2 failure mode where Plex going silent mid-response would block `runSync()` forever.
+- **`plexCommand()` helper** (`lib/plex.ts`). Companion to `plexFetch()` for endpoints that don't return JSON. Supports `GET` and `DELETE`. Used by the new scan start/cancel functions.
+
+### Changed
+
+- **Phase 3 upsert is now chunked** (`lib/sync.ts`). Replaces v0.1.2's "buffer every candidate, write in one giant transaction" approach with `splice()`-and-write batches of 200 candidates each. Each batch is one transaction (still gets the fsync win), then the chunk's references are released so GC can reclaim each `PlexMovie` mid-write. Peak memory stays bounded regardless of library size. `await yieldToEventLoop()` between chunks lets unrelated requests interleave. Addresses the memory pressure that turned a 30-second hang into a swap-thrashed system freeze on a ~3k-movie library.
+- **`yts_checks` schema** dropped `has_bluray_upgrade` and `bluray_qualities`, added `has_upgrade`, `upgrade_tier`, and `current_tier`. Migration uses the existing drop-and-recreate path; `yts_checks` is a cache so no data loss. `movies` table is untouched.
+- **Dashboard upgrade column** ("YTS Upgrade" → "Upgrade") shows the recommended tier label (`BluRay 1080p`, `BluRay 720p`, `WEB 1080p x265`, or `WEB 1080p`) instead of a generic "BluRay" pill. Tooltip shows `Current: X → Upgrade to Y`. Header copy is now "N upgrades available" (no longer BluRay-specific).
+- **`SyncButton` accepts `disabled` and `disabledReason` props** so the status pill wrapper can gate it.
+- **`scripts/test-yts.ts`** prints the tier comparison (`current tier`, `best on YTS`, and the would-be `has_upgrade` value).
+
+### Fixed
+
+- **Permanent server hang on Sync from Plex** for users with mid-scan Plex servers. Two contributing causes: (a) `fetch()` to `/library/sections/{key}/all` had no timeout, so a Plex bulk endpoint stalled by an in-flight library scan would block forever; (b) the `runSync()` rewrite for v0.1.3 had been holding all candidate `PlexMovie` objects in memory through three phases, pushing peak heap into swap territory on a ~3k-movie library. Both are now addressed (fetch timeouts + chunked transactions).
+- **Stale `bluray_qualities` tooltip** that showed the available BluRay qualities is gone, replaced by the tier comparison tooltip.
+
 ## v0.1.2 – 2026-05-25
 
 Adds automatic cleanup of upgraded/deleted movies during sync, and parallelizes the YTS check now that the dev-server overhead is no longer the bottleneck. Roughly 10x faster "Force all" runs.

@@ -45,19 +45,24 @@ function initSchema(db: Database.Database) {
       yts_url TEXT,
       best_source TEXT,
       best_quality TEXT,
-      has_bluray_upgrade INTEGER NOT NULL DEFAULT 0,
-      bluray_qualities TEXT,
+      has_upgrade INTEGER NOT NULL DEFAULT 0,
+      upgrade_tier TEXT,
+      current_tier TEXT,
       torrents_json TEXT,
       checked_at INTEGER NOT NULL
     );
   `);
 
-  // v0.2.0: migrate older yts_checks shape if it exists with missing columns.
-  // The table started empty in v0.1, so a clean recreate is safe.
+  // Schema evolution: yts_checks is a pure cache, so any missing column triggers
+  // a drop + recreate. Subsequent "Check YTS" passes will repopulate it.
+  // History:
+  //   v0.2.0 — added found/best_source/bluray_qualities/yts_id.
+  //   v0.1.3 — replaced has_bluray_upgrade/bluray_qualities with tier-based
+  //            upgrade detection: has_upgrade, upgrade_tier, current_tier.
   const cols = db
     .prepare(`PRAGMA table_info(yts_checks)`)
     .all() as { name: string }[];
-  const required = ['found', 'best_source', 'bluray_qualities', 'yts_id'];
+  const required = ['found', 'best_source', 'has_upgrade', 'upgrade_tier', 'current_tier', 'yts_id'];
   const missing = required.some((c) => !cols.find((x) => x.name === c));
   if (missing) {
     db.exec(`DROP TABLE yts_checks;`);
@@ -70,8 +75,9 @@ function initSchema(db: Database.Database) {
         yts_url TEXT,
         best_source TEXT,
         best_quality TEXT,
-        has_bluray_upgrade INTEGER NOT NULL DEFAULT 0,
-        bluray_qualities TEXT,
+        has_upgrade INTEGER NOT NULL DEFAULT 0,
+        upgrade_tier TEXT,
+        current_tier TEXT,
         torrents_json TEXT,
         checked_at INTEGER NOT NULL
       );
